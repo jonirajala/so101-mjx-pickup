@@ -76,6 +76,17 @@ export XLA_FLAGS=--xla_gpu_cuda_data_dir=$HOME/micromamba/envs/madmjx
 export MADRONA_MWGPU_KERNEL_CACHE=$HOME/.madrona_cache/cache   # cache the slow megakernel JIT
 ```
 
+**Delete the kernel cache after every engine rebuild.** It is not invalidated automatically, and a
+cache built by an older engine fails at load with
+`cuModuleGetFunction ... cudaErrorInvalidValue: invalid argument` (or a `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`
+at init) — the JIT is skipped and a stale module is handed to the driver. `rm $HOME/.madrona_cache/cache`,
+or unset the variable, and the next run recompiles (~3 min).
+
+Related, and why the env is structured the way it is: **after the first Madrona render, XLA can no
+longer load a newly-compiled CUDA module** in the same process. Every JAX kernel must therefore be
+compiled *before* the first render — which is why the env's `reset()` emits blank pixels and the
+first real render happens inside the jitted rollout in `step()`.
+
 ## Verify the build
 
 ```bash

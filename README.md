@@ -14,6 +14,40 @@ and the same weights drive the real arm through two webcams.
 
 <p align="center"><i>overhead cam + wrist cam &nbsp;→&nbsp; 6×16×16 pixels + 12-d proprio &nbsp;→&nbsp; 6-d joint deltas @ 10 Hz</i></p>
 
+## Training setup and results
+
+The reported run was trained on one RTX 3060 Ti with 8 GB VRAM. It used 1024 parallel
+dual-camera environments for 3 million environment steps. Each vectorized step added 1024
+transitions and ran 256 gradient updates (UTD 0.25). A 1 million transition replay buffer lived
+in host RAM. Madrona rendered both cameras at 128×128, then area-downsampled them to the
+16×16 inputs seen by the policy. Episodes lasted 90 policy steps at 10 Hz. Peak GPU memory use
+was about 7.3 GB.
+
+Evaluation over 64 randomized simulation episodes produced:
+
+| Metric | Result |
+|---|---:|
+| Ever grasped | 89.1% |
+| Lifted past the success height while grasped | 64.1% |
+| Still lifted and grasped at episode end | 42.2% |
+| Full success: lift, retain grasp, and return to rest | 32.8% |
+
+The full-success curve was still improving at the 3 million step cutoff. On the real arm, the
+same policy transferred without real-world training data and could find, grasp, and lift objects
+across the trained workspace. The main remaining failure was an off-centre approach where a
+finger pushed the object before the jaw closed.
+
+### Where this differs from Squint
+
+The central Squint idea is retained: aggressively reduce the visual input so the policy cannot
+depend on renderer-specific detail. This implementation adds a second, overhead camera for
+**object discovery and global localization**. The overhead view sees the full radial spawn area,
+including positions outside the initial wrist-camera frame. It guides the long-range approach;
+the wrist camera then provides the close-range feedback needed to align, descend, and grasp.
+Unlike the original Squint setup, cube discovery is therefore not left to the wrist view alone.
+Both views are still squinted to 16×16 and learned end to end by one policy. There is no separate
+detector, pose estimator, or scripted camera handoff.
+
 ## Why this needed engine patches
 
 Stock Madrona-MJX raytraces a scene that *looks* different from what a webcam sees, and

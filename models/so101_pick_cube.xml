@@ -1,0 +1,125 @@
+<mujoco model="so101 pick cube">
+  <!-- SO-101 cube-pickup task scene: the MJX-adapted arm + a free-joint cuboid on a table.
+       The scene owns the table/floor, the cube, the grasp-pad contact sensors, and the keyframe. -->
+  <include file="so101_real/so101_mjx.xml"/>
+
+  <statistic center="0.05 -0.15 0.05" extent="0.5"/>
+
+  <!-- MJX-friendly solver settings: small timestep, implicitfast, low iteration counts,
+       eulerdamp disabled. cone=elliptic/impratio=10 come from so101_mjx.xml's <option>.
+       The tight tolerance (1e-10) resolves contact normal forces precisely, reducing post-grasp
+       slip. The `noslip` solver is intentionally NOT set — it is a CPU-only post-solve pass that
+       MJX does not run, so it would be a silent no-op. -->
+  <option timestep="0.004" iterations="6" ls_iterations="8" integrator="implicitfast"
+          tolerance="1e-10">
+    <flag eulerdamp="disable"/>
+  </option>
+
+  <custom>
+    <numeric data="16" name="max_contact_points"/>
+  </custom>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+      rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.1"/>
+    <!-- Appearance-DR floor materials: the floor matid is randomized across these per world so
+         the policy never overfits one texture; geom_rgba tints on top (matid x rgba = wide range). -->
+    <texture type="2d" name="floor_flat" builtin="flat" rgb1="0.7 0.65 0.55" width="64" height="64"/>
+    <material name="floor_flat" texture="floor_flat" reflectance="0.05"/>
+    <texture type="2d" name="floor_check2" builtin="checker" rgb1="0.6 0.55 0.45"
+      rgb2="0.45 0.4 0.32" width="300" height="300"/>
+    <material name="floor_check2" texture="floor_check2" texuniform="true" texrepeat="9 9" reflectance="0.05"/>
+    <texture type="2d" name="floor_grad" builtin="gradient" rgb1="0.55 0.5 0.45"
+      rgb2="0.3 0.3 0.32" width="128" height="128"/>
+    <material name="floor_grad" texture="floor_grad" texuniform="true" texrepeat="2 2" reflectance="0.08"/>
+    <!-- Cardboard-grain surface cropped from a photo of the real deploy table, so the wrist
+         policy trains on the grain it meets at deploy. geom_rgba tints it per-world (vision_dr);
+         texrepeat tiles it so grain is visible in the ~0.2 m wrist view. Madrona rasterizes file
+         2d textures into tex_data at renderer init, like the builtins. -->
+    <texture type="2d" name="floor_cardboard" file="floor_cardboard.png"/>
+    <material name="floor_cardboard" texture="floor_cardboard" texuniform="true" texrepeat="12 12" reflectance="0.04"/>
+    <!-- Wood-grain tabletop texture (Wood052_1K_Color), rendered untinted (rgba 1 1 1);
+         texrepeat sized so the grain scale fits the 1.209x2.418 m tabletop. -->
+    <texture type="2d" name="wood052" file="table_wood052.png"/>
+    <material name="wood052" texture="wood052" texuniform="false" texrepeat="1 1" reflectance="0.04" rgba="1 1 1 1"/>
+    <mesh name="tabletop_quad" file="tabletop_quad.obj" inertia="shell"/>
+  </asset>
+
+  <worldbody>
+    <!-- Madrona ignores the camera headlight, so the scene needs its own lights (two directional).
+         Colour/dir/ambient are DR'd per-episode (vision_dr -> light_diffuse/light_dir/light_ambient,
+         read by the patched additive shader); only directional + castshadow come from here.
+         castshadow=false on both: the policy trains shadowless, and Madrona would otherwise
+         ray-trace hard shadows. -->
+    <light pos="0 -0.2 1.2" dir="0 0 -1" directional="true" castshadow="false" diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3"/>
+    <light pos="0.3 -0.4 0.8" dir="-0.3 0.4 -0.8" directional="true" castshadow="false" diffuse="0.5 0.5 0.5"/>
+    <!-- debug third-person camera (not used in training) -->
+    <camera name="debug_ext" pos="0.35 -0.55 0.35" xyaxes="0.84 0.55 0  -0.2 0.3 0.93" fovy="55"/>
+    <!-- FINITE tabletop box (1.209 x 2.418 m, top surface at z=0, robot base at the back edge,
+         0.73 m tall). A finite box (not a plane) matters twice: a MuJoCo PLANE collides as an
+         infinite half-space, and the visible table EDGE / off-table region is the dominant
+         structural cue for the broad overhead view. conaffinity=0: the table does NOT see the
+         grasp pads, so the pads pass THROUGH the table and the grip lands high on the cube and
+         lifts; the finger<->table sensors below therefore read 0. cube<->table collides via bit0. -->
+    <geom name="table" type="box" pos="0.617 0 -0.365" size="0.6045 1.209 0.365" material="floor_cardboard" contype="1" conaffinity="0"/>
+    <!-- VISUAL tabletop quad (mesh -> has UVs, unlike the box) at z=+1mm for the wood-grain
+         texture mode. Visual only; the box owns the flat-colour modes + collision. vision_dr
+         DRs this geom's matid per-world (textured vs hidden/flat). -->
+    <geom name="tabletop_tex" type="mesh" mesh="tabletop_quad" pos="0.617 0 0.001" material="wood052" group="2" contype="0" conaffinity="0"/>
+    <!-- OFF-TABLE ground: the room floor at z=-0.73 (table height) so it is render-visible beyond
+         the table edge, large enough to fill the overhead view to the horizon. Finite render size
+         so Madrona's raytracer hits it; contype=1 = a safety floor if the cube is knocked off the
+         table. DR'd as its own colour family (vision_dr), distinct from the table. -->
+    <geom name="floor" type="plane" pos="0 0 -0.73" size="20.0 20.0 0.05" material="floor_flat" contype="1" conaffinity="4"/>
+
+    <!-- Flat cuboid ~5.2x4.0x2.1 cm, ~8.7 g: a flat wide cuboid is easier to grasp top-down AND
+         occupies more pixels at 16x16 than a symmetric cube (resting z = half_z = 0.0105).
+         condim=4 + priority so the cube's friction dominates the grasp contact; solref matches
+         the jaw pads. -->
+    <body name="box" pos="0.035 -0.18 0.0105">
+      <freejoint name="box_free"/>
+      <geom type="box" name="box" size="0.026 0.020 0.0105" mass="0.0087"
+        condim="4" priority="1" friction="2 0.05 0.001" solref="0.01 1"
+        rgba="0 0.8 0.2 1" contype="2" conaffinity="1"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <!-- Grasp detection (geom-level; MJX has no body-matching contact sensors).
+         is_grasped := (any fixed-jaw pad touches box) AND (any moving-jaw pad touches box),
+         force>=0.5N on both jaws. data="force" -> a real force-closed grip, not a graze. -->
+    <contact name="fixed_pad1_box" geom1="fixed_jaw_pad_1" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="fixed_pad2_box" geom1="fixed_jaw_pad_2" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="fixed_pad3_box" geom1="fixed_jaw_pad_3" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="fixed_pad4_box" geom1="fixed_jaw_pad_4" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="moving_pad1_box" geom1="moving_jaw_pad_1" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="moving_pad2_box" geom1="moving_jaw_pad_2" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="moving_pad3_box" geom1="moving_jaw_pad_3" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <contact name="moving_pad4_box" geom1="moving_jaw_pad_4" geom2="box" data="force" reduce="maxforce" num="1"/>
+    <!-- TABLE-TOUCH sensors (pad<->table). INERT here: table conaffinity=0 means the pads pass
+         through the table, so these always read 0. Kept so the reward keeps its 7-term structure. -->
+    <contact name="fp1_table" geom1="fixed_jaw_pad_1" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="fp2_table" geom1="fixed_jaw_pad_2" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="fp3_table" geom1="fixed_jaw_pad_3" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="fp4_table" geom1="fixed_jaw_pad_4" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="mp1_table" geom1="moving_jaw_pad_1" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="mp2_table" geom1="moving_jaw_pad_2" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="mp3_table" geom1="moving_jaw_pad_3" geom2="table" data="force" reduce="maxforce" num="1"/>
+    <contact name="mp4_table" geom1="moving_jaw_pad_4" geom2="table" data="force" reduce="maxforce" num="1"/>
+  </sensor>
+
+  <keyframe>
+    <!-- nq=13: arm(5) + gripper(1) + box free joint(7: pos xyz, quat wxyz). ctrl=arm+gripper(6).
+         Home = gripper hovering over the workspace (IK to [0.03,-0.18,0.13], jaw open 0.6).
+         The env recomputes this via IK at init; this keyframe is for standalone viewing. -->
+    <key name="home"
+      qpos="1.5619 -1.4412 1.1658 0.7893 -1.6233 0.6   0.035 -0.18 0.015   1 0 0 0"
+      ctrl="1.5619 -1.4412 1.1658 0.7893 -1.6233 0.6"/>
+  </keyframe>
+</mujoco>

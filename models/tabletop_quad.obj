@@ -1,0 +1,14 @@
+# Tabletop visual quad for #9 Wood052 texture (Madrona needs mesh UVs; a box primitive has none).
+# Centered at origin, spans the P3-matched tabletop 1.209 x 2.418 m, normal +z. UVs scaled so the
+# Wood052 grain scale roughly matches P3's table.glb over the tabletop (tuned in the comparison).
+v -0.6045 -1.209 0
+v 0.6045 -1.209 0
+v 0.6045 1.209 0
+v -0.6045 1.209 0
+vt 0 0
+vt 0 2
+vt 4 2
+vt 4 0
+vn 0 0 1
+f 1/1/1 2/2/1 3/3/1
+f 1/1/1 3/3/1 4/4/1

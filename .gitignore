@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+out/
+runs/
+*.pkl
+*.log
+MUJOCO_LOG.TXT
+.DS_Store

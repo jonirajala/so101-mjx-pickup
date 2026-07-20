@@ -1,0 +1,273 @@
+diff --git a/include/madrona/render/ecs.hpp b/include/madrona/render/ecs.hpp
+index 1a4f826..65ca0c0 100644
+--- a/include/madrona/render/ecs.hpp
++++ b/include/madrona/render/ecs.hpp
+@@ -16,6 +16,14 @@ struct RenderCamera {
+     math::Vector3 cameraOffset;
+ };
+ 
++// Per-world override of the camera vertical FOV scale (== 1.0 / tanf(fovy*0.5)).
++// viewTransformUpdate writes this into PerspectiveCameraData every frame so the FOV
++// can be domain-randomized per world (the GPU path otherwise freezes xScale/yScale at
++// construction). A value <= 0 means "keep the RenderCamera-baked fovScale" (safe default).
++struct CameraFovScale {
++    float scale;
++};
++
+ // This will be attached to any renderable entity
+ struct Renderable {
+     Entity renderEntity;
+@@ -86,6 +94,14 @@ struct LightDesc {
+ 
+     // Gives ability to turn light on or off.
+     bool active;
++
++    // Per-light diffuse colour RGB. Carries Phase-3 warm/cool tint * intensity
++    // (SAPIEN folds intensity into the colour). Default {1,1,1}.
++    math::Vector3 color;
++
++    // Per-world ambient RGB (Phase-3 `ambient_light`). Stored identically on every
++    // light; the shader seeds from light[0]. Default {0.2,0.2,0.2} (the old fixed floor).
++    math::Vector3 ambient;
+ };
+ 
+ struct LightDescDirection : math::Vector3 {
+@@ -110,6 +126,18 @@ struct LightDescIntensity {
+     float intensity;
+ };
+ 
++struct LightDescColor : math::Vector3 {
++    LightDescColor(math::Vector3 v)
++        : Vector3(v)
++    {}
++};
++
++struct LightDescAmbient : math::Vector3 {
++    LightDescAmbient(math::Vector3 v)
++        : Vector3(v)
++    {}
++};
++
+ struct LightDescActive {
+     bool active;
+ };
+diff --git a/src/mw/cuda_exec.cpp b/src/mw/cuda_exec.cpp
+index e7b87de..63705f2 100644
+--- a/src/mw/cuda_exec.cpp
++++ b/src/mw/cuda_exec.cpp
+@@ -1112,7 +1112,6 @@ static BVHKernels buildBVHKernels(const CompileConfig &cfg,
+             "-fma=1",
+             // "-optimize-unused-variables",
+             "-lto",
+-            "-lineinfo",
+             "-maxrregcount=96"
+         };
+ 
+@@ -1173,7 +1172,6 @@ static BVHKernels buildBVHKernels(const CompileConfig &cfg,
+             "-dlto",
+             "-DMADRONA_MWGPU_BVH_MODULE",
+             "-arch", gpu_arch_str.c_str(),
+-            "-lineinfo",
+             "-maxrregcount=96"
+         };
+ 
+@@ -1405,15 +1403,19 @@ static GPUKernels buildKernels(const CompileConfig &cfg,
+ 
+     DynArray<const char *> compile_flags = std::move(common_compile_flags);
+ 
+-    // No way to disable optimizations in nvrtc besides enabling debug mode
+-    fast_compile_flags.push_back("-G");
++    // Upstream pushed "-G" here to get unoptimized PTX, but under CUDA 12.6
++    // NVRTC + cccl 3.5 libcu++ the resulting debug info fails the LLVM verifier
++    // ("function with debug info must have a !dbg location"). Drop it; the fast
++    // PTX is auxiliary (the real LTO artifact comes from the opt compile).
+ 
+     if (opt_mode == CompileConfig::OptMode::Debug) {
+         compile_flags.push_back("--device-debug");
+     } else {
+         compile_flags.push_back("-dopt=on");
+         compile_flags.push_back("--extra-device-vectorization");
+-        compile_flags.push_back("-lineinfo");
++        // -lineinfo dropped: triggers an LLVM verifier failure under CUDA 12.6
++        // NVRTC + cccl 3.5 libcu++ atomics ("function with debug info must have
++        // a !dbg location"). Only affects profiling line numbers.
+     }
+ 
+     if (opt_mode == CompileConfig::OptMode::LTO) {
+@@ -1442,7 +1444,6 @@ static GPUKernels buildKernels(const CompileConfig &cfg,
+     if (opt_mode == CompileConfig::OptMode::Debug) {
+         linker_flags.push_back("-g");
+     } else {
+-        linker_flags.push_back("-lineinfo");
+         linker_flags.push_back("-lto");
+     }
+ 
+diff --git a/src/mw/device/bvh_raycast.cpp b/src/mw/device/bvh_raycast.cpp
+index 7c4fa52..5b5fca9 100644
+--- a/src/mw/device/bvh_raycast.cpp
++++ b/src/mw/device/bvh_raycast.cpp
+@@ -866,14 +866,21 @@ static __device__ FragmentResult computeFragment(
+         Vector3 hit_pos = trace_info.rayOrigin +
+                           first_hit.depth * trace_info.rayDirection;
+ 
+-        Vector3 acc_color = Vector3{ 0.f, 0.f, 0.f };
+-
+-        float light_contrib = 0.f;
++        // PHASE-3 / SAPIEN-minimal additive shading, 1:1 with the ManiSkill sensor rasterizer:
++        //   color = albedo * ( ambient_rgb + sum_lights light_color * clamp(N.L,0,1) * shadow )
++        // ambient_rgb is per-world (stored identically on every light -> seed from light[0]);
++        // light_color carries Phase-3 warm/cool tint * per-light intensity. This REPLACES the old
++        // white, non-DR'd `max(0.2, sum clamp(N.L)) * albedo` (fixed floor, no colour/intensity,
++        // MAX-combine instead of additive) -- the one renderer gap that no image-space DR could close.
++        Vector3 acc = (world_info.numLights > 0)
++                          ? world_info.lights[0].ambient
++                          : Vector3{ 0.2f, 0.2f, 0.2f };
+ 
+         for (int i = 0; i < world_info.numLights; ++i) {
+             LightDesc desc = world_info.lights[i];
+ 
+             float cutoff = -1.f;
++            float lambert = 0.f;
+ 
+             Vector3 light_dir = -desc.direction;
+             if (desc.type == LightDesc::Type::Spotlight) {
+@@ -910,15 +917,23 @@ static __device__ FragmentResult computeFragment(
+                             }, world_info);
+ 
+                     if (!shadow_hit.hit) {
+-                        light_contrib += fminf(fmaxf(first_hit.normal.dot(light_dir), 0.f), 1.f);
++                        lambert = fminf(fmaxf(first_hit.normal.dot(light_dir), 0.f), 1.f);
+                     }
+                 }
+             } else {
+-                light_contrib += fminf(fmaxf(first_hit.normal.dot(light_dir), 0.f), 1.f);
++                lambert = fminf(fmaxf(first_hit.normal.dot(light_dir), 0.f), 1.f);
+             }
++
++            // ADDITIVE, colour-weighted contribution (Phase-3 sum of light_color * Lambert).
++            acc = acc + lambert * desc.color;
+         }
+ 
+-        acc_color = fmaxf(0.2, light_contrib) * first_hit.color;
++        // Modulate by albedo (component-wise; no Vector3*Vector3 Hadamard operator in madrona math).
++        Vector3 acc_color = {
++            acc.x * first_hit.color.x,
++            acc.y * first_hit.color.y,
++            acc.z * first_hit.color.z,
++        };
+         acc_color.x = fminf(1.f, acc_color.x);
+         acc_color.y = fminf(1.f, acc_color.y);
+         acc_color.z = fminf(1.f, acc_color.z);
+diff --git a/src/render/ecs_system.cpp b/src/render/ecs_system.cpp
+index 8064aeb..95fb32e 100644
+--- a/src/render/ecs_system.cpp
++++ b/src/render/ecs_system.cpp
+@@ -188,6 +188,8 @@ inline void lightUpdate(Context &ctx,
+                         const LightDescShadow &shadow,
+                         const LightDescCutoffAngle &angle,
+                         const LightDescIntensity &intensity,
++                        const LightDescColor &color,
++                        const LightDescAmbient &ambient,
+                         const LightDescActive &active,
+                         LightCarrier &carrier)
+ {
+@@ -205,6 +207,8 @@ inline void lightUpdate(Context &ctx,
+     desc.direction = dir;
+     desc.cutoff = angle.cutoff;
+     desc.intensity = intensity.intensity;
++    desc.color = color;
++    desc.ambient = ambient;
+     desc.active = active.active;
+ }
+ 
+@@ -276,19 +280,31 @@ inline void viewTransformUpdate(Context &ctx,
+                                 Entity e,
+                                 const Position &pos,
+                                 const Rotation &rot,
+-                                const RenderCamera &cam)
++                                const RenderCamera &cam,
++                                const CameraFovScale &fov_override)
+ {
+     Vector3 camera_pos = pos + cam.cameraOffset;
+ 
++    // Per-world FOV: prefer the DR'd override (>0), else the baked RenderCamera scale.
++    float fov_scale = (fov_override.scale > 0.f) ? fov_override.scale : cam.fovScale;
++
+ #if defined(MADRONA_GPU_MODE)
+     (void)e;
+ 
+-    PerspectiveCameraData &cam_data = 
++    PerspectiveCameraData &cam_data =
+         ctx.get<PerspectiveCameraData>(cam.cameraEntity);
+ 
+-    ctx.get<RenderOutputIndex>(cam.cameraEntity).index = 
++    ctx.get<RenderOutputIndex>(cam.cameraEntity).index =
+         ctx.loc(e).row;
+ 
++    // The GPU path skips xScale/yScale below (they are written only on CPU at
++    // construction), so the FOV would otherwise be frozen forever. Write the
++    // per-world scale here every frame. Ray-gen uses a SQUARE viewport (aspect 1),
++    // so xScale == fov_scale; only yScale carries the sign convention.
++    cam_data.xScale = fov_scale;
++    cam_data.yScale = -fov_scale;
++    cam_data.zNear = cam.zNear;
++
+ #else
+     auto &system_state = ctx.singleton<RenderingSystemState>();
+     uint32_t view_id = system_state.totalNumViewsCPU->fetch_add<sync::acq_rel>(1);
+@@ -304,8 +320,8 @@ inline void viewTransformUpdate(Context &ctx,
+     cam_data.worldIDX = ctx.worldID().idx;
+ 
+ #if !defined(MADRONA_GPU_MODE)
+-    float x_scale = cam.fovScale / system_state.aspectRatio;
+-    float y_scale = -cam.fovScale;
++    float x_scale = fov_scale / system_state.aspectRatio;
++    float y_scale = -fov_scale;
+ 
+     cam_data.xScale = x_scale;
+     cam_data.yScale = y_scale;
+@@ -403,6 +419,7 @@ void registerTypes(ECSRegistry &registry,
+ #endif
+ 
+     registry.registerComponent<RenderCamera>();
++    registry.registerComponent<CameraFovScale>();
+     registry.registerComponent<Renderable>();
+     registry.registerComponent<PerspectiveCameraData>();
+     registry.registerComponent<InstanceData>();
+@@ -416,6 +433,8 @@ void registerTypes(ECSRegistry &registry,
+     registry.registerComponent<LightDescShadow>();
+     registry.registerComponent<LightDescCutoffAngle>();
+     registry.registerComponent<LightDescIntensity>();
++    registry.registerComponent<LightDescColor>();
++    registry.registerComponent<LightDescAmbient>();
+     registry.registerComponent<LightDescActive>();
+     registry.registerComponent<LightCarrier>();
+ 
+@@ -523,6 +542,8 @@ TaskGraphNodeID setupTasks(TaskGraphBuilder &builder,
+                 LightDescShadow,
+                 LightDescCutoffAngle,
+                 LightDescIntensity,
++                LightDescColor,
++                LightDescAmbient,
+                 LightDescActive,
+                 LightCarrier
+             >>({instance_setup});
+@@ -533,7 +554,8 @@ TaskGraphNodeID setupTasks(TaskGraphBuilder &builder,
+             Entity,
+             Position,
+             Rotation,
+-            RenderCamera
++            RenderCamera,
++            CameraFovScale
+         >>({instance_setup});
+ 
+     auto mortoncode_update = builder.addToGraph<ParallelForNode<Context,
+@@ -723,6 +745,8 @@ void makeEntityLightCarrier(Context &ctx, Entity e)
+         .cutoff = ctx.get<LightDescCutoffAngle>(e).cutoff,
+         .intensity = ctx.get<LightDescIntensity>(e).intensity,
+         .active = ctx.get<LightDescActive>(e).active,
++        .color = ctx.get<LightDescColor>(e),
++        .ambient = ctx.get<LightDescAmbient>(e),
+     };
+ }
+ 

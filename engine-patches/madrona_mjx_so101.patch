@@ -1,0 +1,363 @@
+diff --git a/src/bindings.cpp b/src/bindings.cpp
+index e5be876..c65c0c1 100644
+--- a/src/bindings.cpp
++++ b/src/bindings.cpp
+@@ -182,7 +182,9 @@ NB_MODULE(_madrona_mjx_batch_renderer, m) {
+                         nb::ndarray<const float, nb::shape<-1, 3>> light_dir,
+                         nb::ndarray<const bool, nb::shape<-1>> light_isdir,
+                         nb::ndarray<const bool, nb::shape<-1>> light_castshadow,
+-                        nb::ndarray<const float, nb::shape<-1>> light_cutoff)
++                        nb::ndarray<const float, nb::shape<-1>> light_cutoff,
++                        nb::ndarray<const float, nb::shape<-1, 3>> light_color,
++                        nb::ndarray<const float, nb::shape<-1, 3>> light_ambient)
+ 
+         {
+             mgr.init((math::Vector3 *)geom_pos.data(),
+@@ -196,7 +198,9 @@ NB_MODULE(_madrona_mjx_batch_renderer, m) {
+                      (math::Vector3 *)light_dir.data(),
+                      (bool *)light_isdir.data(),
+                      (bool *)light_castshadow.data(),
+-                     (float *)light_cutoff.data());
++                     (float *)light_cutoff.data(),
++                     (math::Vector3 *)light_color.data(),
++                     (math::Vector3 *)light_ambient.data());
+         })
+         .def("render", [](Manager &mgr,
+                           nb::ndarray<const float, nb::shape<-1, -1, 3>> geom_pos,
+diff --git a/src/madrona_mjx/renderer.py b/src/madrona_mjx/renderer.py
+index 24951e1..10549fe 100644
+--- a/src/madrona_mjx/renderer.py
++++ b/src/madrona_mjx/renderer.py
+@@ -136,16 +136,18 @@ class BatchRenderer:
+       use_rasterizer=False,
+       viz_gpu_hdls=None,
+   ):
+-    mesh_verts = m.mesh_vert
+-    mesh_faces = m.mesh_face
+-    mesh_vert_offsets = m.mesh_vertadr
+-    mesh_face_offsets = m.mesh_faceadr
+-    mesh_texcoords = m.mesh_texcoord
+-    mesh_texcoord_offsets = m.mesh_texcoordadr
+-    mesh_texcoord_num = m.mesh_texcoordnum
+-    geom_types = m.geom_type
+-    geom_groups = m.geom_group
+-    geom_data_ids = m.geom_dataid
++    # Madrona's nanobind binding requires CPU numpy arrays for every model
++    # field; force-host all of them (mjx.Model fields may be JAX arrays).
++    mesh_verts = np.asarray(m.mesh_vert)
++    mesh_faces = np.asarray(m.mesh_face)
++    mesh_vert_offsets = np.asarray(m.mesh_vertadr)
++    mesh_face_offsets = np.asarray(m.mesh_faceadr)
++    mesh_texcoords = np.asarray(m.mesh_texcoord)
++    mesh_texcoord_offsets = np.asarray(m.mesh_texcoordadr)
++    mesh_texcoord_num = np.asarray(m.mesh_texcoordnum)
++    geom_types = np.asarray(m.geom_type)
++    geom_groups = np.asarray(m.geom_group)
++    geom_data_ids = np.asarray(m.geom_dataid)
+     geom_sizes = jax.device_get(m.geom_size)
+     geom_mat_ids = jax.device_get(m.geom_matid)
+     geom_rgba = jax.device_get(m.geom_rgba)
+@@ -163,16 +165,16 @@ class BatchRenderer:
+     self.enabled_cameras = enabled_cameras
+     num_cams = len(enabled_cameras)
+ 
+-    mat_tex_ids = m.mat_texid
+-    tex_data = m.tex_data
++    mat_tex_ids = np.asarray(m.mat_texid)
++    tex_data = np.asarray(m.tex_data)
+     # add 255 every third element to create 4 channel rgba texture
+     tex_data = np.insert(
+         tex_data, np.arange(3, tex_data.shape[0], 3), 255, axis=0
+     )
+-    tex_offsets = m.tex_adr
+-    tex_widths = m.tex_width
+-    tex_heights = m.tex_height
+-    tex_nchans = m.tex_nchannel
++    tex_offsets = np.asarray(m.tex_adr)
++    tex_widths = np.asarray(m.tex_width)
++    tex_heights = np.asarray(m.tex_height)
++    tex_nchans = np.asarray(m.tex_nchannel)
+ 
+     self.madrona = MadronaBatchRenderer(
+         gpu_id=gpu_id,
+@@ -201,7 +203,7 @@ class BatchRenderer:
+         num_worlds=num_worlds,
+         batch_render_view_width=batch_render_view_width,
+         batch_render_view_height=batch_render_view_height,
+-        cam_fovy=m.cam_fovy,
++        cam_fovy=np.asarray(m.cam_fovy),
+         enabled_geom_groups=enabled_geom_groups,
+         add_cam_debug_geo=add_cam_debug_geo,
+         use_rt=not use_rasterizer,
+@@ -301,6 +303,13 @@ class BatchRenderer:
+         model.light_type == 1, jp.bool
+     )
+ 
++    # Per-world camera FOV scale (== 1/tan(fovy/2)). Feeding it here (per-world) lets
++    # the patched engine (CameraFovScale component) apply a TRUE geometric FOV per world
++    # so vision_dr can jitter cam_fovy per episode (replaces the old image-space fov_zoom).
++    cam_fovscale = 1.0 / jp.tan(
++        jp.radians(model.cam_fovy[self.enabled_cameras]) * 0.5
++    )
++
+     init_rgb, init_depth, render_token = self.init_prim_fn(
+         render_token,
+         state.geom_xpos,
+@@ -315,6 +324,9 @@ class BatchRenderer:
+         light_isdir,
+         model.light_castshadow,
+         model.light_cutoff,
++        model.light_diffuse,
++        model.light_ambient,
++        cam_fovscale,
+     )
+ 
+     return render_token, init_rgb, init_depth
+diff --git a/src/mgr.cpp b/src/mgr.cpp
+index d1fa8be..dd8f9c0 100644
+--- a/src/mgr.cpp
++++ b/src/mgr.cpp
+@@ -112,6 +112,9 @@ struct JAXIO {
+     bool *lightIsDir;
+     bool *lightCastShadow;
+     float *lightCutoff;
++    Vector3 *lightColor;
++    Vector3 *lightAmbient;
++    float *camFovScale;
+ 
+     uint8_t *rgbOut;
+     float *depthOut;
+@@ -131,6 +134,9 @@ struct JAXIO {
+         auto light_isdir = (bool *)buffers[buf_idx++];
+         auto light_castshadow = (bool *)buffers[buf_idx++];
+         auto light_cutoff = (float *)buffers[buf_idx++];
++        auto light_color = (Vector3 *)buffers[buf_idx++];
++        auto light_ambient = (Vector3 *)buffers[buf_idx++];
++        auto cam_fovscale = (float *)buffers[buf_idx++];
+         auto rgb_out = (uint8_t *)buffers[buf_idx++];
+         auto depth_out = (float *)buffers[buf_idx++];
+ 
+@@ -147,6 +153,9 @@ struct JAXIO {
+             .lightIsDir = light_isdir,
+             .lightCastShadow = light_castshadow,
+             .lightCutoff = light_cutoff,
++            .lightColor = light_color,
++            .lightAmbient = light_ambient,
++            .camFovScale = cam_fovscale,
+             .rgbOut = rgb_out,
+             .depthOut = depth_out,
+         };
+@@ -175,6 +184,9 @@ struct JAXIO {
+             .lightIsDir = nullptr,
+             .lightCastShadow = nullptr,
+             .lightCutoff = nullptr,
++            .lightColor = nullptr,
++            .lightAmbient = nullptr,
++            .camFovScale = nullptr,
+             .rgbOut = rgb_out,
+             .depthOut = depth_out,
+         };
+@@ -271,8 +283,18 @@ struct Manager::Impl {
+         bool *light_isdir,
+         bool *light_castshadow,
+         float *light_cutoff,
++        Vector3 *light_color,
++        Vector3 *light_ambient,
++        float *cam_fovscale,
+         cudaStream_t strm)
+     {
++        if (cam_fovscale != nullptr) {
++            cudaMemcpyAsync(
++                gpuExec.getExported((CountT)ExportID::CameraFovScales),
++                cam_fovscale,
++                sizeof(float) * numCams * cfg.numWorlds,
++                cudaMemcpyDeviceToDevice, strm);
++        }
+         cudaMemcpyAsync(
+             gpuExec.getExported((CountT)ExportID::InstanceMatOverrides),
+             mat_overrides,
+@@ -316,6 +338,16 @@ struct Manager::Impl {
+                 light_cutoff,
+                 sizeof(float) * numLights * cfg.numWorlds,
+                 cudaMemcpyDeviceToDevice, strm);
++            cudaMemcpyAsync(
++                gpuExec.getExported((CountT)ExportID::LightColors),
++                light_color,
++                sizeof(Vector3) * numLights * cfg.numWorlds,
++                cudaMemcpyDeviceToDevice, strm);
++            cudaMemcpyAsync(
++                gpuExec.getExported((CountT)ExportID::LightAmbients),
++                light_ambient,
++                sizeof(Vector3) * numLights * cfg.numWorlds,
++                cudaMemcpyDeviceToDevice, strm);
+         }
+     }
+ 
+@@ -330,11 +362,14 @@ struct Manager::Impl {
+                      Vector3 *light_dir,
+                      bool *light_isdir,
+                      bool *light_castshadow,
+-                     float *light_cutoff)
++                     float *light_cutoff,
++                     Vector3 *light_color,
++                     Vector3 *light_ambient,
++                     float *cam_fovscale)
+     {
+         MWCudaLaunchGraph init_graph =
+             gpuExec.buildLaunchGraph(TaskGraphID::Init);
+-        
++
+         MWCudaLaunchGraph render_init_graph =
+             gpuExec.buildLaunchGraph(TaskGraphID::RenderInit);
+ 
+@@ -343,7 +378,8 @@ struct Manager::Impl {
+         copyInTransforms(geom_positions, geom_rotations,
+                          cam_positions, cam_rotations, 0);
+         copyInProperties(geom_sizes, mat_ids, geom_rgb, light_pos, light_dir,
+-            light_isdir, light_castshadow, light_cutoff, 0);
++            light_isdir, light_castshadow, light_cutoff, light_color,
++            light_ambient, cam_fovscale, 0);
+ 
+         gpuExec.run(render_init_graph);
+         renderImpl();
+@@ -428,6 +464,9 @@ struct Manager::Impl {
+             jax_io.lightIsDir,
+             jax_io.lightCastShadow,
+             jax_io.lightCutoff,
++            jax_io.lightColor,
++            jax_io.lightAmbient,
++            jax_io.camFovScale,
+             strm);
+ 
+         gpuExec.runAsync(render_init_graph, strm);
+@@ -846,12 +885,14 @@ void Manager::init(math::Vector3 *geom_pos, math::Quat *geom_rot,
+                    int32_t *mat_ids, uint32_t *geom_rgb,
+                    math::Diag3x3 *geom_sizes, math::Vector3 *light_pos,
+                    math::Vector3 *light_dir, bool *light_isdir,
+-                   bool *light_castshadow, float *light_cutoff)
++                   bool *light_castshadow, float *light_cutoff,
++                   math::Vector3 *light_color, math::Vector3 *light_ambient,
++                   float *cam_fovscale)
+ {
+     impl_->init(
+         geom_pos, geom_rot, cam_pos, cam_rot, mat_ids, geom_rgb, geom_sizes,
+-        light_pos, light_dir, light_isdir, light_castshadow, 
+-        light_cutoff);
++        light_pos, light_dir, light_isdir, light_castshadow,
++        light_cutoff, light_color, light_ambient, cam_fovscale);
+ }
+ 
+ void Manager::render(math::Vector3 *geom_pos, math::Quat *geom_rot,
+diff --git a/src/mgr.hpp b/src/mgr.hpp
+index fb3a0cc..7871a61 100644
+--- a/src/mgr.hpp
++++ b/src/mgr.hpp
+@@ -92,7 +92,10 @@ public:
+                          madrona::math::Vector3 *light_dir,
+                          bool *light_isdir,
+                          bool *light_castshadow,
+-                         float *light_cutoff);
++                         float *light_cutoff,
++                         madrona::math::Vector3 *light_color,
++                         madrona::math::Vector3 *light_ambient,
++                         float *cam_fovscale = nullptr);
+     
+     MGR_EXPORT void render(madrona::math::Vector3 *geom_pos,
+                            madrona::math::Quat *geom_rot,
+diff --git a/src/sim.cpp b/src/sim.cpp
+index c49bd45..47be0d6 100644
+--- a/src/sim.cpp
++++ b/src/sim.cpp
+@@ -41,6 +41,10 @@ void Sim::registerTypes(ECSRegistry &registry, const Config &cfg)
+         (uint32_t)ExportID::LightShadows);
+     registry.exportColumn<LightEntity, render::LightDescCutoffAngle>(
+         (uint32_t)ExportID::LightCutoffAngles);
++    registry.exportColumn<LightEntity, render::LightDescColor>(
++        (uint32_t)ExportID::LightColors);
++    registry.exportColumn<LightEntity, render::LightDescAmbient>(
++        (uint32_t)ExportID::LightAmbients);
+      
+     if (cfg.useDebugCamEntity) {
+         registry.registerArchetype<DebugCameraEntity>();
+@@ -49,6 +53,8 @@ void Sim::registerTypes(ECSRegistry &registry, const Config &cfg)
+             (uint32_t)ExportID::CameraPositions);
+         registry.exportColumn<DebugCameraEntity, Rotation>(
+             (uint32_t)ExportID::CameraRotations);
++        registry.exportColumn<DebugCameraEntity, render::CameraFovScale>(
++            (uint32_t)ExportID::CameraFovScales);
+     } else {
+         registry.registerArchetype<CameraEntity>();
+ 
+@@ -56,6 +62,8 @@ void Sim::registerTypes(ECSRegistry &registry, const Config &cfg)
+             (uint32_t)ExportID::CameraPositions);
+         registry.exportColumn<CameraEntity, Rotation>(
+             (uint32_t)ExportID::CameraRotations);
++        registry.exportColumn<CameraEntity, render::CameraFovScale>(
++            (uint32_t)ExportID::CameraFovScales);
+     }
+ 
+     if (cfg.useRT) {
+@@ -167,6 +175,9 @@ Sim::Sim(Engine &ctx,
+         }
+         ctx.get<Position>(cam) = Vector3::zero();
+         ctx.get<Rotation>(cam) = Quat { 1, 0, 0, 0 };
++        // 0 => "use the RenderCamera-baked fovScale"; the per-world DR value (if any)
++        // is copied in each render init via ExportID::CameraFovScales.
++        ctx.get<render::CameraFovScale>(cam).scale = 0.f;
+         render::RenderingSystem::attachEntityToView(
+             ctx, cam, cfg.camFovy[cam_idx], 0.001f, Vector3::zero());
+     }
+@@ -178,6 +189,8 @@ Sim::Sim(Engine &ctx,
+         ctx.get<render::LightDescShadow>(light).castShadow = false;
+         ctx.get<render::LightDescDirection>(light) = Vector3{-1.f, -1.f, -1.8f};
+         ctx.get<render::LightDescIntensity>(light).intensity = 3.f;
++        ctx.get<render::LightDescColor>(light) = Vector3{1.f, 1.f, 1.f};
++        ctx.get<render::LightDescAmbient>(light) = Vector3{0.2f, 0.2f, 0.2f};
+         ctx.get<render::LightDescActive>(light).active = true;
+ 
+         RenderingSystem::makeEntityLightCarrier(ctx, light);
+diff --git a/src/sim.hpp b/src/sim.hpp
+index 49a8296..c0307a8 100644
+--- a/src/sim.hpp
++++ b/src/sim.hpp
+@@ -27,6 +27,9 @@ enum class ExportID : uint32_t {
+     LightTypes,
+     LightShadows,
+     LightCutoffAngles,
++    LightColors,
++    LightAmbients,
++    CameraFovScales,
+     NumExports,
+ };
+ 
+diff --git a/src/types.hpp b/src/types.hpp
+index f13a938..6a74b33 100644
+--- a/src/types.hpp
++++ b/src/types.hpp
+@@ -50,6 +50,8 @@ struct LightEntity : public madrona::Archetype<
+     madrona::render::LightDescShadow,
+     madrona::render::LightDescCutoffAngle,
+     madrona::render::LightDescIntensity,
++    madrona::render::LightDescColor,
++    madrona::render::LightDescAmbient,
+     madrona::render::LightDescActive,
+     madrona::render::LightCarrier
+ > {};
+@@ -66,13 +68,15 @@ struct RenderEntity : public madrona::Archetype<
+ struct CameraEntity : public madrona::Archetype<
+     Position,
+     Rotation,
+-    madrona::render::RenderCamera
++    madrona::render::RenderCamera,
++    madrona::render::CameraFovScale
+ > {};
+ 
+ struct DebugCameraEntity : public madrona::Archetype<
+     ObjectInstance,
+     madrona::render::Renderable,
+-    madrona::render::RenderCamera
++    madrona::render::RenderCamera,
++    madrona::render::CameraFovScale
+ > {};
+ 
+ }

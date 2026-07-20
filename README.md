@@ -18,12 +18,16 @@ and the same weights drive the real arm through two webcams.
 
 Released checkpoint (`sac_dual_cam.pkl` on [HF](https://huggingface.co/jonirajala/so101-mjx-pickup), 1024 envs / 3M env steps / UTD 0.25):
 
-| metric (sim eval, N=64 episodes) | value |
+| `rollout_diag.py` metric (sim eval, N=64 episodes) | value |
 |---|---|
-| ever grasped | **93.8 %** |
-| lifted while grasped | 57.8 % |
-| holding the lift at episode end | 39.1 % |
-| full success (lift + hold + return to rest) | 29.7 % |
+| ever grasped | **89.1 %** |
+| lifted past the success line while grasped | 64.1 % |
+| still lifted + grasped at episode end | 42.2 % |
+| full success (lift + grasp + returned to rest) | 32.8 % |
+
+Reproduce with the command in step 3 below. Expect a few points of spread between runs —
+cube spawn, lighting, appearance and physics are re-drawn every episode, so N=64 still carries
+sampling noise.
 
 The full-success curve had **not plateaued** at the 3M cutoff — training longer improves the
 recovery behaviours (re-approach after a miss, return to rest) with no code change.

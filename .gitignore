@@ -4,5 +4,6 @@ out/
 runs/
 *.pkl
 *.log
+deploy_config.json
 MUJOCO_LOG.TXT
 .DS_Store

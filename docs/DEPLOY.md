@@ -17,28 +17,46 @@ Inference is a plain CNN forward pass — **no Madrona/GPU needed** on the deplo
 
 ## Software (deploy machine)
 
-Python env with: `lerobot` (arm I/O), `jax` (CPU), `flax`, `brax` (only
-`running_statistics`/network utils for unpickling), `mujoco` (model constants), `opencv-python`,
-`huggingface_hub` (checkpoint download). No renderer.
+Create a separate environment and run `pip install -r requirements-deploy.txt`. Madrona is
+not needed for inference.
 
 ## Calibration
 
-Real-servo ↔ MJX-model joint mapping lives in `deploy.py` (`DEG_OFFSETS`, gripper endpoint
-mapping). The gripper endpoints were measured by hand-moving the jaw to its mechanical stops
-and reading `Present_Position` — re-measure for your arm; a wrong closed-endpoint means the
-policy's "close" never actually shuts the jaw. Probe camera indices with
-`python wrist_camera.py --probe`.
+Calibration is deliberately not shipped as a working default: offsets and gripper endpoints are
+specific to each assembled arm. Copy `deploy_config.example.json` to the ignored
+`deploy_config.json`, then fill it using this procedure:
+
+1. Find the serial port and your existing LeRobot follower calibration ID. Put them in `port`
+   and `robot_id`; set `lerobot_calibration_dir` only if you use a non-default directory.
+2. Run `python deploy.py --port PORT --robot_id ID`. It disables torque. Hand-pose the arm to
+   the training start/home pose shown by the model and press Enter; copy the printed first offset
+   estimates into `arm_offset_deg`.
+3. Determine each `arm_sign` with two limp-arm readings: move one joint alone in the positive
+   MJX direction, read `Present_Position` before and after, and use `+1` if both deltas have the
+   same sign or `-1` if they oppose. Recompute its offset as
+   `real_home_deg - sign * mjx_home_deg`.
+4. With torque still off, move the jaw to its physical closed stop and record
+   `Present_Position` as `jaw_servo_closed`; repeat at the open stop for `jaw_servo_open`.
+5. Anchor shoulder pan to the actual front workspace: place the gripper over a known point on the
+   model centreline and adjust only the pan offset until real and model headings agree.
+6. Start with the blank-pixel, step-gated command below. Before sending actions, inspect the
+   printed commanded-versus-read joint check. Stop if errors are large or the inferred gripper
+   height is wrong. Then verify camera orientation with `python wrist_camera.py --probe`.
+
+The loader rejects the example's null placeholders and equal jaw endpoints. A wrong closed
+endpoint can make the commanded close stop short, so do not guess these values.
 
 ## Run
 
 ```bash
 # 1. dry-run the control loop with blank frames (no cameras, safe bring-up):
-python deploy_vision.py --pixel_source zeros --step
+python deploy_vision.py --config deploy_config.json \
+  --ckpt squint/runs/myrun/policy_best.pkl --pixel_source zeros --step
 
-# 2. real run — dual-cam, released checkpoint (downloads from HF):
+# 2. real run — dual-cam policy trained in this repository:
 python deploy_vision.py --pixel_source webcam --dual_cam \
-    --camera 0 --overhead_camera 1 --hz 30 \
-    --ckpt hf:jonirajala/so101-mjx-pickup/sac_dual_cam.pkl
+    --config deploy_config.json --ckpt squint/runs/myrun/policy_best.pkl \
+    --camera 0 --overhead_camera 1 --hz 30
 
 # 3. diagnose a run: --dump writes per-step obs montages + trace.csv to out/rollout/
 python deploy_vision.py ... --dump
@@ -51,7 +69,5 @@ the wrong thing" (sim2real gap) from "the arm doesn't reach what's commanded" (h
 ## What to expect
 
 Grasps across the 14×20 cm spawn area, lifts, holds, and returns toward the raised rest pose.
-Weakest behaviours of the released checkpoint: re-approach after a missed/slipped grasp, and
-off-centre approaches where the prongs can nudge the cube ("prong-push" — a known sim-fidelity
-limit of the box-pad grasp collision). Training longer than the released 3M steps improves the
-recovery behaviours; the success curve had not plateaued at cutoff.
+A common residual failure mode is an off-centre approach where a prong nudges the cube before
+closure ("prong-push"), a fidelity limit of the simplified box-pad grasp collision.

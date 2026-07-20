@@ -12,12 +12,6 @@ _RENDER = 64                 # so101_vision render size (square)
 _WRIST_ROT_DEG = 180         # inverted mount
 
 
-import math
-# Optional fov_zoom presets (unused by default; deploy square-crops only): tan(fovy/2)/tan(95/2).
-FOVY_ZOOM_60_FROM_95 = math.tan(math.radians(60) / 2) / math.tan(math.radians(95) / 2)  # 0.529
-FOVY_ZOOM_71_FROM_95 = math.tan(math.radians(71) / 2) / math.tan(math.radians(95) / 2)  # 0.654
-
-
 def crop_resize(frame: np.ndarray, size: int = _RENDER, rot_deg: int = _WRIST_ROT_DEG,
                 fov_zoom: float | None = None) -> np.ndarray:
     """Rotate, centre-crop to square, (optional fov_zoom center-crop), resize to (size,size).

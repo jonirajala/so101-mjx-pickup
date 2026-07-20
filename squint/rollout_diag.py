@@ -6,7 +6,7 @@ Then classify each env:
   - GRASP_THEN_SLIP: cube rises while grasped, then contact is lost and it drops
   - LIFTS: cube clears the success height while grasped
 
-  micromamba run -n madmjx python rollout_diag.py --ckpt runs/sac_p3budget/policy_params.pkl --n 64
+  python squint/rollout_diag.py --ckpt squint/runs/myrun/policy_best.pkl --dual_cam
 """
 import argparse, os, sys, pickle
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # 8GB: JAX prealloc starves Madrona
@@ -26,9 +26,10 @@ from mujoco_playground._src.wrapper import wrap_for_brax_training
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="runs/sac_v1/policy_params.pkl")
+    ap.add_argument("--ckpt", required=True, help="local checkpoint produced by train_sac.py")
     ap.add_argument("--n", type=int, default=64)
-    ap.add_argument("--render", type=int, default=32)
+    ap.add_argument("--render", type=int, default=128,
+                    help="render resolution before 16x16 area reduction; must match training")
     ap.add_argument("--dual_cam", action="store_true", help="6-ch wrist+overhead checkpoint")
     args = ap.parse_args()
     Nn = args.n

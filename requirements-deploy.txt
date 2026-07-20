@@ -1,0 +1,8 @@
+jax==0.5.3
+mujoco==3.8.1
+brax==0.12.4
+flax==0.10.4
+numpy==2.1.3
+opencv-python==4.11.0.86
+etils==1.12.2
+lerobot>=0.4,<0.5

@@ -5,11 +5,8 @@ GPU raytracer for MuJoCo MJX). This project needs a **patched** build — the st
 shading does not match what a real webcam sees, and several DR hooks are
 missing (see `engine-patches/`). Two ways to get it:
 
-- **Fork (recommended):** clone `jonirajala/madrona_mjx`, branch `so101-lighting`, with
-  `--recursive` — its `external/madrona` submodule already points at the patched engine.
-- **Patches:** clone upstream `shacklettbp/madrona_mjx` (recursive), then
-  `git apply engine-patches/madrona_mjx_so101.patch` in the repo root and
-  `git apply ../../engine-patches/madrona_engine_so101.patch` in `external/madrona`.
+- **Patches:** clone the pinned upstream Madrona-MJX revision below, recursively, then apply
+  this repository's two patches. This is the supported and fully inspectable route.
 
 What the patches add:
 1. **Additive Lambert lighting** in the raytracer — `albedo * (ambient + Σ light_colour · max(0, N·L))`,
@@ -37,9 +34,7 @@ micromamba create -y -n madmjx -c conda-forge \
   xorg-libxext xorg-libx11 xorg-libxrender xorg-libxfixes libxkbcommon \
   libgl-devel libegl-devel libopengl-devel mesalib
 # PIN cuda-version IN EVERY later install or the solver drifts nvcc to 13.x.
-micromamba run -n madmjx pip install "jax[cuda12_local]==0.5.3" \
-  "mujoco==3.8.1" "mujoco-mjx==3.8.1" "brax==0.12.4" ml_collections etils opencv-python-headless
-micromamba run -n madmjx pip install mujoco_playground==0.1.0   # only _src.mjx_env/_src.wrapper used
+micromamba run -n madmjx pip install -r requirements-train.txt
 ```
 
 If the sysroot's `usr/lib64/{libm,libc}.so` linker scripts break the link with
@@ -56,9 +51,20 @@ done
 
 ## Build
 
+Run these commands from this repository first. `PROJECT_DIR` makes the patch locations
+unambiguous; the commits are the exact revisions used to produce the patches.
+
 ```bash
-git clone --recursive -b so101-lighting https://github.com/jonirajala/madrona_mjx ~/src/madrona_mjx
-cd ~/src/madrona_mjx && mkdir build && cd build
+export PROJECT_DIR="$PWD"
+git clone --recursive https://github.com/shacklettbp/madrona_mjx ~/src/madrona_mjx
+cd ~/src/madrona_mjx
+git checkout 1505699168fd7c0c12629356f357b05491ce9d0c
+git -C external/madrona checkout b46e6ab782cfd06956c35cb2ae42351a3fb5f38c
+git apply --check "$PROJECT_DIR/engine-patches/madrona_mjx_so101.patch"
+git apply "$PROJECT_DIR/engine-patches/madrona_mjx_so101.patch"
+git -C external/madrona apply --check "$PROJECT_DIR/engine-patches/madrona_engine_so101.patch"
+git -C external/madrona apply "$PROJECT_DIR/engine-patches/madrona_engine_so101.patch"
+mkdir build && cd build
 micromamba run -n madmjx cmake .. -DLOAD_VULKAN=OFF -DCMAKE_BUILD_TYPE=Release
 micromamba run -n madmjx cmake --build . -j$(($(nproc)-2))
 cd .. && micromamba run -n madmjx pip install -e .

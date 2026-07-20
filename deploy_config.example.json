@@ -1,0 +1,9 @@
+{
+  "robot_id": "your_so101_follower_id",
+  "port": "/dev/ttyACM0",
+  "lerobot_calibration_dir": null,
+  "arm_sign": [null, null, null, null, null],
+  "arm_offset_deg": [null, null, null, null, null],
+  "jaw_servo_closed": null,
+  "jaw_servo_open": null
+}

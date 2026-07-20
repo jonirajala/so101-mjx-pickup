@@ -14,28 +14,6 @@ and the same weights drive the real arm through two webcams.
 
 <p align="center"><i>overhead cam + wrist cam &nbsp;→&nbsp; 6×16×16 pixels + 12-d proprio &nbsp;→&nbsp; 6-d joint deltas @ 10 Hz</i></p>
 
-## Results
-
-Released checkpoint (`sac_dual_cam.pkl` on [HF](https://huggingface.co/jonirajala/so101-mjx-pickup), 1024 envs / 3M env steps / UTD 0.25):
-
-| `rollout_diag.py` metric (sim eval, N=64 episodes) | value |
-|---|---|
-| ever grasped | **89.1 %** |
-| lifted past the success line while grasped | 64.1 % |
-| still lifted + grasped at episode end | 42.2 % |
-| full success (lift + grasp + returned to rest) | 32.8 % |
-
-Reproduce with the command in step 3 below. Expect a few points of spread between runs —
-cube spawn, lighting, appearance and physics are re-drawn every episode, so N=64 still carries
-sampling noise.
-
-The full-success curve had **not plateaued** at the 3M cutoff — training longer improves the
-recovery behaviours (re-approach after a miss, return to rest) with no code change.
-
-On the real arm the policy grasps across the whole 14×20 cm spawn area, lifts, and holds,
-zero-shot. The known residual failure mode is off-centre approaches where a finger nudges the
-cube before closure ("prong-push") — a limit of the box-pad grasp collision in sim.
-
 ## Why this needed engine patches
 
 Stock Madrona-MJX raytraces a scene that *looks* different from what a webcam sees, and
@@ -70,7 +48,7 @@ several things a sim-to-real DR pipeline needs are not randomizable per world. T
 
 ```
 envs/               MJX cube-pickup env + Madrona RGB rendering + domain randomization
-squint/             SAC+C51 trainer (train_sac.py), env wrapper, nets, eval + probes
+squint/             SAC+C51 trainer, environment wrapper, policy networks and evaluator
 models/             MJCF: SO-101 arm (grasp-pad collision), table scene, cameras
 deploy.py           real-arm hardware library: real<->MJX calibration, LeRobot I/O
 deploy_vision.py    the deploy entry point (webcams -> policy -> servo targets)
@@ -93,14 +71,15 @@ micromamba run -n madmjx python squint/train_sac.py --dual_cam --name myrun
 
 ```bash
 micromamba run -n madmjx python squint/rollout_diag.py --ckpt squint/runs/myrun/policy_best.pkl --dual_cam
-# or the released checkpoint:
-#   --ckpt hf:jonirajala/so101-mjx-pickup/sac_dual_cam.pkl
 ```
 
 **4. Deploy** on a real SO-101 — [docs/DEPLOY.md](docs/DEPLOY.md). Inference is CPU-only:
 
 ```bash
-python deploy_vision.py --pixel_source webcam --dual_cam --camera 0 --overhead_camera 1
+cp deploy_config.example.json deploy_config.json  # fill this with your calibration
+python deploy_vision.py --config deploy_config.json \
+  --ckpt squint/runs/myrun/policy_best.pkl \
+  --pixel_source webcam --dual_cam --camera 0 --overhead_camera 1
 ```
 
 ## Method notes
@@ -108,8 +87,9 @@ python deploy_vision.py --pixel_source webcam --dual_cam --camera 0 --overhead_c
 RL: Squint-style SAC with a C51 distributional critic (101 atoms, support ±20), twin critics,
 γ 0.9, τ 0.01, alpha autotune, shared CNN encoder trained by the critic (actor gets detached
 features), DrQ random-shift + random-scale augmentation on the replay batch. Control is 10 Hz
-position-target deltas (arm ±0.1 rad/step, gripper ±0.2), 9 s episodes. Reward is a six-term
-dense shaping (reach, grasp, lift, hold, table-touch penalty, return-to-rest), normalized to
+position-target deltas (arm ±0.1 rad/step, gripper ±0.2), 9 s episodes. Reward is a seven-term
+dense shaping (reach, grasp, not-lifted penalty, lift, hold, table-touch penalty,
+return-to-rest), normalized to
 ~1/step. See `squint/train_sac.py` — every hyperparameter is an argparse flag with its meaning.
 
 ## License & attribution

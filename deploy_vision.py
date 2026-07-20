@@ -17,9 +17,11 @@ wrist/overhead cams framed to match the sim cameras (wrist_camera.py). Madrona i
 needed — inference is a plain CNN forward pass.
 
   # dry-run the control loop with a blank frame (no camera, safe bring-up):
-  python deploy_vision.py --pixel_source zeros --step
+  python deploy_vision.py --config deploy_config.json --ckpt squint/runs/myrun/policy_best.pkl \
+      --pixel_source zeros --step
   # real run (dual cam; probe indices with `python wrist_camera.py --probe`):
-  python deploy_vision.py --pixel_source webcam --dual_cam --camera 0 --overhead_camera 1
+  python deploy_vision.py --config deploy_config.json --ckpt squint/runs/myrun/policy_best.pkl \
+      --pixel_source webcam --dual_cam --camera 0 --overhead_camera 1
 """
 from __future__ import annotations
 
@@ -30,8 +32,7 @@ import time
 
 import numpy as np
 
-import deploy
-from deploy import RealArmMJX, make_robot, reset_to, resolve_ckpt
+from deploy import RealArmMJX, load_calibration, make_robot, reset_to
 from deploy_obs import ObsBuilder, DeltaTargetController
 from model_loader import load_mj_model
 
@@ -45,14 +46,6 @@ _ACTION_SIZE = 6
 # whole 14x20 cm spawn at t=0. This MUST be the deploy reset pose — a wrong start is OOD from step 0.
 _SQUINT_START_ARM_DEG = np.array([0.0, -20.0, 0.0, 90.0, -90.0])
 _SQUINT_START_JAW_DEG = 60.0   # start gripper (slightly open)
-
-# Front-frame real<->MJX zero alignment for the vision deploy. Height (lift/elbow/wrist_flex) and
-# roll come from deploy.ARM_OFFSET_DEG; only PAN differs. PAN is ANCHORED functionally: with a
-# cube at a known front position, the offset is set so the arm actually reaches it (here real
-# servo pan 0 <-> MJX pan -3.53deg, so offset = +3.53). Roll is left as-is: position-only IK
-# cannot robustly anchor wrist_roll (underdetermined). Re-derive for YOUR arm.
-VISION_ARM_OFFSET_DEG = deploy.ARM_OFFSET_DEG.copy()
-VISION_ARM_OFFSET_DEG[0] = 3.53   # shoulder_pan: front-anchored
 
 # Per-joint per-step action delta the policy trained with (squint_env._action_scale):
 # arm +/-0.1, gripper +/-0.2 rad/step. Deploy MUST use this exact per-joint vector — a uniform
@@ -73,7 +66,7 @@ def load_squint_sac_policy(ckpt_path: str):
     from brax.training import networks as bnet
     import squint_sac_net as SN
 
-    with open(resolve_ckpt(ckpt_path), "rb") as f:
+    with open(ckpt_path, "rb") as f:
         norm, enc_p, act_p = pickle.load(f)
 
     enc, actor = SN.CNNEncoder(), SN.Actor(action_size=_ACTION_SIZE)
@@ -164,6 +157,7 @@ def make_dual_pixel_source(wrist_index: int, overhead_index: int, overhead_rot: 
 # Control loop (mirrors deploy.run; cube pose replaced by live depth perception)
 # ======================================================================================
 def run(args):
+    calibration = load_calibration(args.config)
     model = load_mj_model()
     ob = ObsBuilder(model)
     # Reset pose MUST match the policy's training t=0 distribution (the elevated squint
@@ -188,7 +182,7 @@ def run(args):
     act = load_squint_sac_policy(args.ckpt)
     print("reset/start pose: squint standoff (z=0.20, jaw open)",
           flush=True)
-    print(f"loaded {args.policy} policy from {args.ckpt}", flush=True)
+    print(f"loaded SAC policy from {args.ckpt}", flush=True)
     # NO external zoom by default: only square-crop (min(h,w)) + resize the real feed, with the
     # SIM camera calibrated to match it. Over-cropping a normal ~70deg webcam pushes the cube out
     # of frame; sim-camera calibration is the correct knob. --fov_zoom only forces an override.
@@ -207,12 +201,8 @@ def run(args):
     else:
         get_pixels = make_pixel_source(args.pixel_source, args.camera, fov_zoom=fov_zoom)
 
-    robot = make_robot(args.port, args.calib_dir)
-    # The policy trains in the FRONT-facing workspace -> use the front-frame pan calibration.
-    arm_offset = VISION_ARM_OFFSET_DEG
-    arm = RealArmMJX(robot, max_rel_deg=args.max_rel_deg, arm_offset_deg=arm_offset)
-    print(f"pan calibration: {'front-frame anchored (+3.53)' if arm_offset is not None else 'default'}",
-          flush=True)
+    robot = make_robot(calibration)
+    arm = RealArmMJX(robot, calibration, max_rel_deg=args.max_rel_deg)
     arm.start()
     from lerobot.utils.robot_utils import precise_sleep
     dt = 1.0 / args.hz
@@ -242,8 +232,6 @@ def run(args):
               f"read={g_act[2]*100-1.05:5.1f}cm   (table at 1.05cm; model start = 12cm)")
         print(f"gripper FK forward(x):          cmd={g_cmd[0]*100:5.1f}cm  read={g_act[0]*100:5.1f}cm\n", flush=True)
 
-        prev_q = arm.read_q()
-        prev_action = np.zeros(_ACTION_SIZE)
         grasped_latch = False
         # The policy consumes a 12-d proprio = [qpos(6), target_qpos(6)] (measured joints + the
         # controller's accumulated TARGET) — the grasp-commitment memory + load/stall gap,
@@ -251,9 +239,6 @@ def run(args):
         for t in range(args.max_steps):
             t0 = time.perf_counter()
             q = arm.read_q()
-            qd = (q - prev_q) / dt          # finite-difference velocity (qvel DR covers noise)
-            prev_q = q
-
             grip, _ = ob.gripper_pose(q)
             # proprio = [q(6), ctrl.target(6)] (the controller accumulator is the
             # commitment + load signal); the cube is perceived from the camera images.
@@ -262,8 +247,6 @@ def run(args):
             pixels = normalize_rgb(px_u8)
 
             action = np.clip(act(proprio27, pixels), -1.0, 1.0)
-            prev_action = action          # policy sees its own intended action next step
-
             # HEIGHT-GATED GRASP (optional deploy band-aid): while the gripper-site is above
             # --grasp_below_z and we haven't latched, suppress JAW CLOSING (MJX gripper: + = open)
             # so the arm must descend to the cube before the jaw can close on air.
@@ -340,12 +323,9 @@ def run(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--policy", default="sac", choices=["sac"],
-                    help="the SAC vision policy (squint/train_sac.py)")
-    ap.add_argument("--ckpt", default="hf:jonirajala/so101-mjx-pickup/sac_dual_cam.pkl",
-                    help="SAC policy checkpoint (norm,encoder,actor). Default = the released dual-cam "
-                         "policy (use with --dual_cam --pixel_source webcam). Accepts a local path "
-                         "(runs/<name>/policy_best.pkl) or hf:<repo>/<file>. Obs = 6-ch 16x16 "
+    ap.add_argument("--ckpt", required=True,
+                    help="local checkpoint produced by squint/train_sac.py "
+                         "(squint/runs/<name>/policy_best.pkl). Obs = 6-ch 16x16 "
                          "[overhead,wrist] pixels + 12-d proprio [qpos(6), target_qpos(6)] -- the "
                          "controller target is the grasp-commitment memory; deploy builds the identical "
                          "[q, ctrl.target] (build_state_minimal).")
@@ -366,8 +346,8 @@ if __name__ == "__main__":
                     help="OPTIONAL center-zoom on the real wrist crop. DEFAULT None = no zoom "
                          "(rot180 + square-crop + resize only). The right fix for a sim/real fovy "
                          "gap is sim-camera calibration, not cropping the real feed.")
-    ap.add_argument("--port", default="/dev/tty.usbmodem5B415308971")
-    ap.add_argument("--calib_dir", default=None)
+    ap.add_argument("--config", required=True,
+                    help="path to your deploy calibration JSON; copy deploy_config.example.json")
     ap.add_argument("--hz", type=float, default=30.0,
                     help="control rate. The policy trains at 10 Hz but deploys well at 30 Hz with "
                          "deploy_action_scale 0.15: per-step delta 0.015/0.03 rad (smooth, 0.45 rad/s), "
